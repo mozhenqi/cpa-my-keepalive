@@ -1,15 +1,19 @@
 name: keepalive
-on:
-  workflow_dispatch:
 
+on:
+  workflow_dispatch:   # 只能被手动/API 触发，由 Cloudflare 定时调用
+
+# 同一时间只允许一个任务运行；新任务触发时，立刻取消正在跑的旧任务
 concurrency:
   group: keepalive
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   visit:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    # 超时时间（分钟）：必须大于 keepalive.mjs 里的 RUN_MINUTES，建议多留 10 分钟
+    # 单个任务上限 360 分钟
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
