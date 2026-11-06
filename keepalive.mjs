@@ -11,53 +11,41 @@ const browser = await chromium.launch({
   headless: false,
   args: ['--no-sandbox', '--disable-blink-features=AutomationControlled'],
 });
-const context = await browser.newContext({ userAgent: UA, locale: 'en-US', viewport: { width: 1366, height: 768 } });
+const context = await browser.newContext({
+  userAgent: UA,
+  locale: 'en-US',
+  viewport: { width: 1366, height: 768 },
+});
 const page = await context.newPage();
 await page.addInitScript(() => Object.defineProperty(navigator, 'webdriver', { get: () => undefined }));
 
-// 记录页面发出的所有请求，看有没有唤醒接口
-page.on('request', r => console.log('REQ', r.method(), r.url().replace(/^(https?:\/\/[^/]+).*/, '$1') + new URL(r.url()).pathname));
-page.on('response', r => console.log('RES', r.status(), new URL(r.url()).pathname));
-page.on('console', m => console.log('CONSOLE', m.type(), m.text()));
+const isSleeping = (t) => /asleep|waking/i.test(t);
 
-const res = await page.goto(url, { waitUntil: 'load', timeout: 60000 });
-console.log('status', res?.status(), 'title', await page.title());
+let res = await page.goto(url, { waitUntil: 'load', timeout: 60000 });
+let title = await page.title();
+console.log('first visit:', res?.status(), title);
 
-// 可见文字
-console.log('--- innerText ---');
-console.log((await page.innerText('body')).slice(0, 1500));
+if (isSleeping(title)) {
+  const btn = page.getByRole('button', { name: /wake it up/i });
+  if (await btn.count()) {
+    console.log('app is asleep, clicking wake button');
+    await btn.first().click().catch(e => console.log('click failed:', e.message));
+  }
 
-// 按钮、链接、表单
-console.log('--- buttons/links/forms ---');
-console.log(JSON.stringify(await page.evaluate(() => ({
-  buttons: [...document.querySelectorAll('button, [role=button], input[type=submit]')].map(b => (b.innerText || b.value || '').trim()),
-  links: [...document.querySelectorAll('a')].map(a => ({ t: a.innerText.trim(), h: a.getAttribute('href') })),
-  forms: [...document.querySelectorAll('form')].map(f => ({ action: f.action, method: f.method })),
-  scripts: [...document.querySelectorAll('script')].map(s => s.src || s.textContent.trim().slice(0, 300)),
-  iframes: [...document.querySelectorAll('iframe')].map(i => i.src),
-})), null, 2));
-
-// 尝试点击疑似唤醒按钮
-const btn = page.locator('button, [role=button], input[type=submit], a').filter({ hasText: /wake|start|open|resume|continue|visit/i }).first();
-if (await btn.count()) {
-  console.log('clicking:', (await btn.innerText().catch(() => '')).trim());
-  await btn.click().catch(e => console.log('click failed:', e.message));
-} else {
-  console.log('no wake-like button found');
-}
-
-// 等最多 90 秒，看页面是否变成正常内容
-let woke = false;
-for (let i = 0; i < 18 && !woke; i++) {
-  await page.waitForTimeout(5000);
-  const t = await page.title();
-  console.log(`wait ${(i + 1) * 5}s, title: ${t}`);
-  if (!/asleep/i.test(t)) woke = true;
-}
-if (!woke) {
-  await page.reload({ waitUntil: 'load' }).catch(() => {});
-  console.log('after reload title:', await page.title());
+  let ok = false;
+  for (let i = 1; i <= 24; i++) {          // 最多等 约 2 分钟
+    await page.waitForTimeout(5000);
+    res = await page.reload({ waitUntil: 'load', timeout: 60000 }).catch(() => null);
+    title = await page.title().catch(() => '');
+    const status = res?.status();
+    console.log(`poll ${i}: ${status}, ${title}`);
+    if (status === 200 && !isSleeping(title)) { ok = true; break; }
+  }
+  await browser.close();
+  console.log(ok ? 'woke up OK' : 'failed to wake');
+  process.exit(ok ? 0 : 1);
 }
 
 await browser.close();
-process.exit(woke ? 0 : 1);
+console.log('app already awake');
+process.exit(res?.status() === 200 ? 0 : 1);
