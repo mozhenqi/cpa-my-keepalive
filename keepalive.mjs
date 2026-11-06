@@ -1,13 +1,13 @@
 // =====================================================================
-//  blitz.cloud 保活脚本（修复 15 分钟假活 / 缓存未穿透问题）
+//  blitz.cloud 保活脚本（公开仓库隐私脱敏 + 防缓存穿透版）
 // =====================================================================
 
 import { chromium } from 'playwright-core';
 
 // ============================ 配置区 ============================
 const RUN_MINUTES = 65;
-const INTERVAL_SEC = 240;      // 缩短基础间隔到 4 分钟，确保 15 分钟内至少穿透 3 次
-const JITTER_SEC = 45;         // 随机抖动 ±45 秒（实际 195~285 秒）
+const INTERVAL_SEC = 240;      // 基础间隔 4 分钟
+const JITTER_SEC = 45;         // 随机抖动 ±45 秒
 const WAKE_TIMEOUT_SEC = 120;
 const WAKE_POLL_SEC = 5;
 const NETWORK_IDLE_TIMEOUT_MS = 30000;
@@ -24,12 +24,17 @@ if (!rawUrl) {
   process.exit(1);
 }
 
+// 【隐私保护】通知 GitHub Actions 将 URL 和域名在日志中强制打码为 ***，防止报错信息意外泄露
+console.log(`::add-mask::${rawUrl}`);
+try {
+  console.log(`::add-mask::${new URL(rawUrl).host}`);
+} catch {}
+
 const ts = () => new Date().toISOString().slice(11, 19);
 const isSleeping = (title, gate) =>
   SLEEP_TITLE_REGEX.test(title) || gate === 'asleep' || gate === 'waking';
 const randInt = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
 
-// 给 URL 加上随机防缓存参数，强制穿透 blitz 边缘网关直达容器后端
 function buildBustUrl(base) {
   const u = new URL(base);
   u.searchParams.set('_t', Date.now().toString());
@@ -55,11 +60,10 @@ const shutdown = async (signal) => {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// 注意：不要设置假的 Windows USER_AGENT！保持与 Linux Runner 原生最新 Chrome 一致
 const context = await browser.newContext({
   locale: 'en-US',
   viewport: { width: 1366, height: 768 },
-  serviceWorkers: 'block', // 阻止 Service Worker 缓存拦截请求
+  serviceWorkers: 'block',
 });
 
 await context.addInitScript(() => {
@@ -68,7 +72,6 @@ await context.addInitScript(() => {
 
 const page = await context.newPage();
 
-// 通过 CDP 彻底关闭页面级缓存
 const cdp = await context.newCDPSession(page);
 await cdp.send('Network.enable');
 await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
@@ -80,7 +83,6 @@ async function settle() {
   await page.waitForTimeout(randInt(EXTRA_STAY_MS[0], EXTRA_STAY_MS[1]));
 }
 
-// 在页面内额外发一次带 no-store 的同源请求，确保后端容器收到活跃心跳
 async function sendHeartbeatPing() {
   await page
     .evaluate(async () => {
@@ -108,25 +110,26 @@ async function visit() {
   const res = await openPage();
   const title = await page.title().catch(() => '');
   const gate = res?.headers()['x-blitz-gate'] || '-';
-  console.log(`[${ts()}] status ${res?.status()} gate=${gate} title=${title}`);
+  const sleeping = isSleeping(title, gate);
 
-  // 如果应用正常在线，发送一次防缓存心跳后结束本轮
-  if (res?.status() === 200 && !isSleeping(title, gate)) {
+  // 只打印状态（ONLINE 或 SLEEPING），不打印真实网页 title
+  console.log(
+    `[${ts()}] status ${res?.status()} gate=${gate} state=${sleeping ? 'SLEEPING' : 'ONLINE'}`
+  );
+
+  if (res?.status() === 200 && !sleeping) {
     await sendHeartbeatPing();
     return;
   }
 
-  // 如果处于 asleep 状态且有按钮，点击唤醒按钮
   const btn = page.getByRole('button', { name: WAKE_BUTTON_REGEX });
   if (await btn.count()) {
     console.log(`[${ts()}] asleep -> clicking wake`);
-    await btn.first().click().catch((e) => console.log('click failed:', e.message));
+    await btn.first().click().catch(() => console.log('click failed'));
   } else {
-    // 处理 gate=waking 的情况（正在唤醒中，没有按钮，但需要等待它启动完毕）
     console.log(`[${ts()}] state is ${gate} (no wake button), waiting for container...`);
   }
 
-  // 轮询等待应用彻底唤醒
   const tries = Math.ceil(WAKE_TIMEOUT_SEC / WAKE_POLL_SEC);
   for (let i = 0; i < tries; i++) {
     await page.waitForTimeout(WAKE_POLL_SEC * 1000);
@@ -138,7 +141,7 @@ async function visit() {
     if (r?.status() === 200 && !isSleeping(t, g)) {
       await settle();
       await sendHeartbeatPing();
-      console.log(`[${ts()}] woke up, title=${await page.title()}`);
+      console.log(`[${ts()}] woke up, state=ONLINE`);
       return;
     }
   }
@@ -160,7 +163,8 @@ while (Date.now() < endAt) {
     await visit();
     await idleActions();
   } catch (e) {
-    console.log(`[${ts()}] error: ${e.message}`);
+    // 仅打印错误类型，避免错误信息中带出 URL 参数
+    console.log(`[${ts()}] visit error occurred`);
   }
   const waitSec = randInt(INTERVAL_SEC - JITTER_SEC, INTERVAL_SEC + JITTER_SEC);
   console.log(`[${ts()}] next visit in ${waitSec}s`);
