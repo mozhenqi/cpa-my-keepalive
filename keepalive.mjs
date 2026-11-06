@@ -1,6 +1,6 @@
 // =====================================================================
 //  blitz.cloud 保活脚本（运行在 GitHub Actions 里）
-//  作用：用真实浏览器反复访问你的应用，应用休眠时自动点击 "Wake it up"
+//  作用：用真实浏览器定时访问你的应用，应用休眠时自动点击 "Wake it up"
 // =====================================================================
 
 import { chromium } from 'playwright-core';
@@ -15,13 +15,17 @@ import { chromium } from 'playwright-core';
 // 同时要小于 workflow 里的 timeout-minutes（见 keepalive.yml）。
 const RUN_MINUTES = 65;
 
-// 【两次访问之间的间隔，秒】
-// 必须明显小于 15 分钟（900 秒），因为 blitz 免费版 15 分钟无访问就休眠。
-// 120 秒是比较稳妥的值，不建议超过 300。
-const INTERVAL_SEC = 120;
+// 【基础访问间隔，秒】
+// blitz 免费版 15 分钟（900 秒）无访问就休眠，所以这里要远小于 900。
+const INTERVAL_SEC = 300;
+
+// 【随机抖动，秒】
+// 实际间隔 = INTERVAL_SEC ± JITTER_SEC 之间的随机值。
+// 例：300 与 60 → 每次间隔在 240~360 秒之间随机。
+// 注意：INTERVAL_SEC + JITTER_SEC + 单次访问耗时（约 40 秒）必须明显小于 900。
+const JITTER_SEC = 60;
 
 // 【唤醒后最多等待多久，秒】
-// 点击 "Wake it up" 后，轮询页面直到恢复正常，超过这个时间就放弃这一轮。
 const WAKE_TIMEOUT_SEC = 120;
 
 // 【每隔多少秒轮询一次唤醒状态】
@@ -31,9 +35,8 @@ const WAKE_POLL_SEC = 5;
 // 页面有长连接时永远不会"空闲"，超时后直接继续，不影响结果。
 const NETWORK_IDLE_TIMEOUT_MS = 30000;
 
-// 【网络空闲后额外停留的时间，毫秒】
-// 让统计上报等收尾请求发完，更像真人停留。
-const EXTRA_STAY_MS = 5000;
+// 【网络空闲后额外停留的时间，毫秒】范围 [最小, 最大]，每次随机取值
+const EXTRA_STAY_MS = [4000, 9000];
 
 // 【页面加载超时，毫秒】
 const PAGE_TIMEOUT_MS = 60000;
@@ -61,8 +64,11 @@ if (!url) {
 const ts = () => new Date().toISOString().slice(11, 19);
 const isSleeping = (title) => SLEEP_TITLE_REGEX.test(title);
 
+// 在 [min, max] 之间取随机整数
+const randInt = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+
 // 使用 runner 自带的 Chrome（channel: 'chrome'），不用下载浏览器
-// headless: false 配合 workflow 里的 xvfb-run，避免暴露 HeadlessChrome 特征
+// headless: false 配合 workflow 里的 xvfb-run
 const browser = await chromium.launch({
   channel: 'chrome',
   headless: false,
@@ -90,12 +96,12 @@ await page.addInitScript(() =>
   Object.defineProperty(navigator, 'webdriver', { get: () => undefined })
 );
 
-// 等待页面所有网络请求结束，再多停留几秒
+// 等待页面所有网络请求结束，再随机多停留几秒
 async function settle() {
   await page
     .waitForLoadState('networkidle', { timeout: NETWORK_IDLE_TIMEOUT_MS })
     .catch(() => console.log(`[${ts()}] networkidle timeout, continue`));
-  await page.waitForTimeout(EXTRA_STAY_MS);
+  await page.waitForTimeout(randInt(EXTRA_STAY_MS[0], EXTRA_STAY_MS[1]));
 }
 
 // 打开页面：优先等网络空闲，失败则退回到 load 事件
@@ -140,20 +146,28 @@ async function visit() {
   console.log(`[${ts()}] wake timed out`);
 }
 
-// 主循环：在 RUN_MINUTES 内，每隔 INTERVAL_SEC 访问一次
-console.log(`[${ts()}] start: run ${RUN_MINUTES} min, interval ${INTERVAL_SEC}s`);
+// 模拟页面内的随机操作：移动鼠标、滚动
+async function idleActions() {
+  await page.mouse.move(randInt(150, 900), randInt(150, 600), { steps: randInt(5, 15) });
+  await page.mouse.wheel(0, randInt(80, 300));
+}
+
+// 主循环：在 RUN_MINUTES 内，每隔 INTERVAL_SEC ± JITTER_SEC 访问一次
+console.log(
+  `[${ts()}] start: run ${RUN_MINUTES} min, interval ${INTERVAL_SEC}s ± ${JITTER_SEC}s`
+);
 const endAt = Date.now() + RUN_MINUTES * 60 * 1000;
 
 while (Date.now() < endAt) {
   try {
     await visit();
-    // 模拟一点真人操作：随机移动鼠标、滚动页面
-    await page.mouse.move(200 + Math.random() * 400, 200 + Math.random() * 300);
-    await page.mouse.wheel(0, 150);
+    await idleActions();
   } catch (e) {
     console.log(`[${ts()}] error: ${e.message}`);
   }
-  await page.waitForTimeout(INTERVAL_SEC * 1000);
+  const waitSec = randInt(INTERVAL_SEC - JITTER_SEC, INTERVAL_SEC + JITTER_SEC);
+  console.log(`[${ts()}] next visit in ${waitSec}s`);
+  await page.waitForTimeout(waitSec * 1000);
 }
 
 await browser.close();
